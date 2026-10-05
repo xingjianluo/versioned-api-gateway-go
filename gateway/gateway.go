@@ -3,25 +3,31 @@
 //
 // 单次请求处理顺序（任一环节拒绝都会给出可区分原因，绝不静默转发）：
 //
-//  1. 版本协商：解析客户端版本 -> 路由兼容窗口 -> 同 major 上游能力匹配；
+//  1. 版本协商：解析客户端版本 -> 路由兼容窗口 -> 同 major 上游能力匹配，
+//     产出“兼容候选集”（按版本降序）；
 //  2. 分层限流：调用方层 + 路由层原子双扣；
+//     2.5 灰度分流：只在兼容候选集内按路由分流计划投放；同一业务幂等键
+//     粘性固定，比例调整/回滚不漂移；计划整体校验、原子发布、可整体回滚；
 //  3. 熔断：该上游断路器是否放行（half-open 只放一个探测）；
 //  4. 幂等去重执行：以业务幂等键去重，内部做受限重试；
-//     - 重试只在“协商选定的同一个上游”内发生，绝不重新协商/跨版本；
-//     - 仅 timeout/connection/overload 可重试，semantic 立即失败；
+//     - 重试只在“分流选定的同一个上游”内发生，绝不重新协商/跨版本；
+//     - 首选上游熔断打开或重试耗尽时，按确定性顺序回退到仍健康的
+//     兼容候选（可解释的回退日志），semantic 错误除外（立即失败）；
 //     - 失败的调用没有产生业务结果，业务操作只会在首个成功调用执行一次；
 //     成功结果被幂等层缓存，重复请求直接重放，不再触达上游；
-//  5. 全部尝试失败则进入与故障类别一一对应的降级路径。
+//  5. 全部候选失败则进入与故障类别一一对应的降级路径。
 package gateway
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/xingjianluo/versioned-api-gateway-go/breaker"
 	"github.com/xingjianluo/versioned-api-gateway-go/callback"
+	"github.com/xingjianluo/versioned-api-gateway-go/graysplit"
 	"github.com/xingjianluo/versioned-api-gateway-go/idempotency"
 	"github.com/xingjianluo/versioned-api-gateway-go/internal/logging"
 	"github.com/xingjianluo/versioned-api-gateway-go/ratelimit"
@@ -60,6 +66,12 @@ type Outcome struct {
 	Retries          int
 	Response         *upstream.Response
 	Detail           string
+
+	// 灰度分流决策依据（未配置分流计划时 Rule 为 graysplit.RuleNoPlan）。
+	SplitRule     string // 命中规则：sticky / weighted / no_plan / ...
+	SplitRevision uint64 // 做出选择时的分流计划版本
+	SplitWeights  string // 当时生效的权重快照 "u1=7,u2=3"
+	Fallback      bool   // 是否因首选不可用而回退到了其他候选上游
 }
 
 // RetryPolicy 重试策略：仅对可重试错误且在同一兼容上游内重试。
@@ -76,6 +88,11 @@ type Config struct {
 	RouteLimit  map[string]ratelimit.LayerConfig
 	Breaker     breaker.Config
 	Retry       RetryPolicy
+	// SplitPlans 按路由的灰度分流计划（可空：空则沿用“版本最高者优先”的
+	// 默认顺序，故障时按确定性顺序回退到其他兼容候选）。
+	// 启动期整体校验：非法计划（负权重/全零/超上限/未知上游/未知路由）
+	// 直接使 New 返回错误，绝不静默按默认值放行。
+	SplitPlans map[string][]graysplit.Entry
 }
 
 // Gateway 版本化 API 网关核心。
@@ -85,6 +102,7 @@ type Gateway struct {
 	breakers   *breaker.Registry
 	negotiator *versionx.Negotiator
 	idem       *idempotency.Executor
+	split      *graysplit.Router
 	dispatcher *callback.Dispatcher
 	log        logging.Logger
 
@@ -142,6 +160,7 @@ func New(cfg Config, log logging.Logger, opts ...Option) (*Gateway, error) {
 		limiter:    ratelimit.New(cfg.CallerLimit, cfg.RouteLimit),
 		negotiator: versionx.NewNegotiator(),
 		idem:       idempotency.NewExecutor(),
+		split:      graysplit.NewRouter(),
 		log:        log,
 		adapters:   adapters,
 		upDesc:     descs,
@@ -153,10 +172,65 @@ func New(cfg Config, log logging.Logger, opts ...Option) (*Gateway, error) {
 			"reason": reason,
 		})
 	})
+	// 启动期发布初始分流计划：整体校验，非法配置直接失败。
+	for route, entries := range cfg.SplitPlans {
+		if err := g.validateSplitEntries(route, entries); err != nil {
+			return nil, err
+		}
+		p, err := g.split.SetPlan(route, entries)
+		if err != nil {
+			return nil, fmt.Errorf("route %q: %w", route, err)
+		}
+		g.logf("INFO", "split_plan_published",
+			"route", route, "split_revision", p.Revision, "split_weights", p.String())
+	}
 	for _, o := range opts {
 		o(g)
 	}
 	return g, nil
+}
+
+// validateSplitEntries 校验分流条目引用的路由与上游真实存在。
+func (g *Gateway) validateSplitEntries(route string, entries []graysplit.Entry) error {
+	if _, ok := g.cfg.RouteRules[route]; !ok {
+		return fmt.Errorf("split plan for unknown route %q", route)
+	}
+	for _, e := range entries {
+		if _, ok := g.adapters[e.UpstreamID]; !ok {
+			return fmt.Errorf("split plan route %q references unknown upstream %q",
+				route, e.UpstreamID)
+		}
+	}
+	return nil
+}
+
+// SetSplitPlan 运行时调整某条路由的分流比例。
+// 校验失败（非法比例/未知上游/未知路由）整体拒绝，旧计划保持不变；
+// 校验通过则原子发布，进行中的请求要么看到完整旧计划、要么看到完整新计划。
+// 已粘性固定的业务键不随比例调整漂移。
+func (g *Gateway) SetSplitPlan(route string, entries []graysplit.Entry) error {
+	if err := g.validateSplitEntries(route, entries); err != nil {
+		return err
+	}
+	p, err := g.split.SetPlan(route, entries)
+	if err != nil {
+		return err
+	}
+	g.logf("INFO", "split_plan_published",
+		"route", route, "split_revision", p.Revision, "split_weights", p.String())
+	return nil
+}
+
+// RollbackSplitPlan 整体回滚到上一份分流计划（以新 Revision 发布）。
+// 没有历史计划时返回错误，当前计划不变。
+func (g *Gateway) RollbackSplitPlan(route string) error {
+	p, err := g.split.Rollback(route)
+	if err != nil {
+		return err
+	}
+	g.logf("INFO", "split_plan_rollback",
+		"route", route, "split_revision", p.Revision, "split_weights", p.String())
+	return nil
 }
 
 // Dispatcher 返回已挂载的回调调度器（可能为 nil）。
@@ -230,45 +304,107 @@ func (g *Gateway) Serve(ctx context.Context, caller, requestID, clientVersion,
 		"caller_remaining", fmt.Sprintf("%.2f", ld.CallerRemaining),
 		"route_remaining", fmt.Sprintf("%.2f", ld.RouteRemaining))...)
 
-	adapter := g.adapters[dec.Selected.ID]
-	if adapter == nil {
-		return Outcome{RequestID: requestID, Allowed: false, Status: "rejected",
-			Reason: ReasonNoUpstream}
+	// 2.5 灰度分流：只在协商得出的兼容候选集内选择目标上游。
+	// 同一业务幂等键粘性固定；比例调整不漂移；首选不可用时按确定性
+	// 顺序回退到其他兼容候选（绝不跨出版本兼容集）。
+	candIDs := make([]string, len(dec.Candidates))
+	versions := make(map[string]string, len(dec.Candidates))
+	for i, c := range dec.Candidates {
+		candIDs[i] = c.ID
+		versions[c.ID] = c.Version.String()
 	}
-	br := g.breakers.Get(dec.Selected.ID)
+	sd := g.split.Pick(route, idemKey, candIDs)
+	g.logf("INFO", "split_decided", append(baseFields,
+		"stage", "split", "decision", sd.Ordered[0],
+		"split_rule", sd.Rule, "split_revision", sd.Revision,
+		"split_weights", sd.Weights, "split_pinned", sd.Pinned,
+		"candidates", strings.Join(candIDs, ","))...)
 
-	// 3+4. 幂等去重执行（内含同上游受限重试）
+	// 3+4. 幂等去重执行（内含同上游受限重试 + 兼容候选间回退）
 	req := upstream.Request{
 		RequestID: requestID, Route: route, Version: dec.Selected.Version.String(),
 		IdemKey: idemKey, Payload: payload,
 	}
 	res, err := g.idem.Do(ctx, idemKey, func() (any, error) {
-		return g.invokeWithRetry(ctx, br, dec.Selected.ID, adapter, req, baseFields)
+		return g.invokeWithFallback(ctx, sd, versions, req, baseFields)
 	})
 	if err != nil {
-		o := g.mapUpstreamFailure(requestID, dec.Selected.ID, dec.Selected.Version.String(),
-			err, baseFields)
+		o := g.mapUpstreamFailure(requestID, sd, err, baseFields)
 		o.VersionNote = dec.Detail
 		return o
 	}
 	ir := res.(invokeResult)
 	stats := g.idem.StatsOf(idemKey)
 	g.logf("INFO", "gateway_ok", append(baseFields,
-		"stage", "complete", "decision", "ok", "upstream", dec.Selected.ID,
+		"stage", "complete", "decision", "ok", "upstream", ir.upstreamID,
+		"split_rule", sd.Rule, "split_revision", sd.Revision,
+		"split_fallback", ir.fallback,
 		"business_executions", stats.Executed, "replayed", stats.Replayed,
 		"shared", stats.Shared, "retry_count", ir.attempts)...)
 	return Outcome{
 		RequestID: requestID, Allowed: true, Status: "ok", Reason: ReasonOK,
-		SelectedUpstream: dec.Selected.ID, UpstreamVersion: dec.Selected.Version.String(),
+		SelectedUpstream: ir.upstreamID, UpstreamVersion: ir.version,
 		VersionNote: dec.Detail, Retries: ir.attempts, Response: &ir.resp,
+		SplitRule: sd.Rule, SplitRevision: sd.Revision, SplitWeights: sd.Weights,
+		Fallback: ir.fallback,
 	}
+}
+
+// invokeWithFallback 按分流给出的确定性偏好顺序尝试候选上游：
+//   - 每个上游内部仍只做“同上游受限重试”，重试绝不跨上游；
+//   - 首选上游熔断打开/重试耗尽（timeout/connection/overload）时，
+//     回退到下一个仍然健康的兼容候选，并记录可解释的回退日志；
+//   - semantic 错误说明请求本身不合法，立即失败，绝不回退放大。
+func (g *Gateway) invokeWithFallback(ctx context.Context, sd graysplit.Decision,
+	versions map[string]string, req upstream.Request, baseFields []any) (any, error) {
+
+	var lastErr error
+	for i, upID := range sd.Ordered {
+		adapter := g.adapters[upID]
+		if adapter == nil {
+			continue
+		}
+		if i > 0 {
+			g.logf("WARN", "split_fallback", append(baseFields,
+				"stage", "split", "from", sd.Ordered[0], "to", upID,
+				"split_rule", sd.Rule, "split_revision", sd.Revision,
+				"split_weights", sd.Weights,
+				"cause", lastErr.Error())...)
+		}
+		br := g.breakers.Get(upID)
+		upReq := req
+		upReq.Version = versions[upID]
+		res, err := g.invokeWithRetry(ctx, br, upID, adapter, upReq, baseFields)
+		if err == nil {
+			ir := res.(invokeResult)
+			ir.upstreamID = upID
+			ir.version = versions[upID]
+			ir.fallback = i > 0
+			return ir, nil
+		}
+		var ge *gatewayError
+		if !errors.As(err, &ge) {
+			ge = &gatewayError{reason: ReasonUpstreamConnection,
+				kind: upstream.KindConnection, detail: err.Error()}
+		}
+		ge.upstream = upID
+		ge.version = versions[upID]
+		if ge.reason == ReasonUpstreamSemantic {
+			return nil, ge // 语义错误：不回退
+		}
+		lastErr = ge
+	}
+	return nil, lastErr
 }
 
 // invokeWithRetry 在“已选定的同一个上游”内做受限重试。
 // 不重新协商、不切换上游（重试不跨版本）。
 type invokeResult struct {
-	resp     upstream.Response
-	attempts int
+	resp       upstream.Response
+	attempts   int
+	upstreamID string
+	version    string
+	fallback   bool // 是否因首选不可用而回退到了该上游
 }
 
 func (g *Gateway) invokeWithRetry(ctx context.Context, br *breaker.Breaker,
@@ -334,20 +470,25 @@ func (g *Gateway) invokeWithRetry(ctx context.Context, br *breaker.Breaker,
 	return nil, ge
 }
 
-func (g *Gateway) mapUpstreamFailure(requestID, upID, upVer string, err error,
+func (g *Gateway) mapUpstreamFailure(requestID string, sd graysplit.Decision, err error,
 	baseFields []any) Outcome {
 	var ge *gatewayError
 	if !errors.As(err, &ge) {
 		ge = &gatewayError{reason: ReasonUpstreamConnection, kind: upstream.KindConnection}
 	}
+	fallback := ge.upstream != "" && len(sd.Ordered) > 0 && ge.upstream != sd.Ordered[0]
 	o := Outcome{
 		RequestID: requestID, Allowed: false, Status: "degraded",
-		Reason: ge.reason, SelectedUpstream: upID, UpstreamVersion: upVer,
+		Reason: ge.reason, SelectedUpstream: ge.upstream, UpstreamVersion: ge.version,
 		Retries: ge.attempts, Detail: ge.detail,
+		SplitRule: sd.Rule, SplitRevision: sd.Revision, SplitWeights: sd.Weights,
+		Fallback: fallback,
 	}
 	g.logf("WARN", "gateway_degrade", append(baseFields,
-		"stage", "complete", "decision", o.Status, "upstream", upID,
+		"stage", "complete", "decision", o.Status, "upstream", ge.upstream,
 		"reason", ge.reason, "error_kind", ge.kind.String(),
+		"split_rule", sd.Rule, "split_revision", sd.Revision,
+		"split_fallback", fallback,
 		"retry_count", ge.attempts)...)
 	return o
 }
@@ -358,6 +499,8 @@ type gatewayError struct {
 	kind     upstream.ErrorKind
 	detail   string
 	attempts int
+	upstream string
+	version  string
 }
 
 func (e *gatewayError) Error() string {

@@ -139,3 +139,29 @@ func TestNegotiate_V1ClientNeverRoutedToV2(t *testing.T) {
 		t.Fatalf("v1 must not hit v2, got %+v", d)
 	}
 }
+
+func TestNegotiate_CandidatesSortedDescAndSameMajorOnly(t *testing.T) {
+	ups := append(sampleUpstreams(t), UpstreamDesc{
+		ID:      "u-mid",
+		Version: mustVer(t, "1.3.0"),
+		Caps: map[string]Capability{
+			"orders":  {Name: "orders", Since: mustVer(t, "1.0.0")},
+			"refunds": {Name: "refunds", Since: mustVer(t, "1.2.0")},
+		},
+	})
+	n := NewNegotiator()
+	d := n.Negotiate(context.Background(), mustVer(t, "1.2.0"), rule(t), ups)
+	if !d.Allowed {
+		t.Fatalf("got %+v", d)
+	}
+	// u-old 缺 refunds、u-v2 跨 major：候选只有 u-new 与 u-mid，按版本降序。
+	if len(d.Candidates) != 2 {
+		t.Fatalf("candidates=%+v", d.Candidates)
+	}
+	if d.Candidates[0].ID != "u-new" || d.Candidates[1].ID != "u-mid" {
+		t.Fatalf("candidates not sorted desc: %+v", d.Candidates)
+	}
+	if d.Selected.ID != d.Candidates[0].ID {
+		t.Fatalf("selected must equal candidates[0]: %+v", d)
+	}
+}

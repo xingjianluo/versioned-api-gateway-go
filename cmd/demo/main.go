@@ -17,6 +17,7 @@ import (
 	"github.com/xingjianluo/versioned-api-gateway-go/callback"
 	"github.com/xingjianluo/versioned-api-gateway-go/callback/receiver"
 	"github.com/xingjianluo/versioned-api-gateway-go/gateway"
+	"github.com/xingjianluo/versioned-api-gateway-go/graysplit"
 	"github.com/xingjianluo/versioned-api-gateway-go/internal/logging"
 	"github.com/xingjianluo/versioned-api-gateway-go/ratelimit"
 	"github.com/xingjianluo/versioned-api-gateway-go/upstream"
@@ -148,7 +149,79 @@ func main() {
 	section("7. 熔断：连续过载后打开 -> 快速失败 -> 冷却后单探测恢复")
 	demoBreaker(ctx, log)
 
+	section("8. 灰度分流：按比例投放 -> 粘性不漂移 -> 故障回退 -> 整体回滚")
+	demoGraySplit(ctx, log)
+
 	fmt.Println("\nDEMO OK")
+}
+
+// demoGraySplit 演示灰度分流：两个同 major 兼容上游按比例投放，
+// 业务键粘性固定，首选故障时回退，比例可整体回滚。
+func demoGraySplit(ctx context.Context, log logging.Logger) {
+	grayA := &upstream.ScriptedAdapter{
+		StaticDesc: upstream.StaticDesc{ID: "gray-a", Version: "1.4.0",
+			Caps: []string{"orders", "refunds"}},
+		Behavior: &upstream.ScriptedBehavior{},
+	}
+	grayB := &upstream.ScriptedAdapter{
+		StaticDesc: upstream.StaticDesc{ID: "gray-b", Version: "1.3.0",
+			Caps: []string{"orders", "refunds"}},
+		Behavior: &upstream.ScriptedBehavior{},
+	}
+	cfg := gateway.Config{
+		RouteRules: map[string]versionx.RouteRule{
+			"/pay": {MinSupported: v("1.0.0"), MaxSupported: v("1.99.0"),
+				RequiredCaps: []string{"orders", "refunds"}},
+		},
+		Upstreams:   []upstream.Adapter{grayA, grayB},
+		CallerLimit: map[string]ratelimit.LayerConfig{"gray": {Rate: 0, Burst: 1000}},
+		RouteLimit:  map[string]ratelimit.LayerConfig{"/pay": {Rate: 0, Burst: 1000}},
+		Breaker:     breaker.Config{FailureThreshold: 2, OpenCoolDown: time.Second},
+		Retry:       gateway.RetryPolicy{MaxAttempts: 2, AttemptTimeout: 200 * time.Millisecond},
+		// 初始计划：gray-a 拿 8 成，gray-b 拿 2 成。
+		SplitPlans: map[string][]graysplit.Entry{"/pay": {
+			{UpstreamID: "gray-a", Weight: 8}, {UpstreamID: "gray-b", Weight: 2},
+		}},
+	}
+	gw, err := gateway.New(cfg, log)
+	must(err)
+
+	// 非法比例被明确拒绝，旧计划不变。
+	if err := gw.SetSplitPlan("/pay", []graysplit.Entry{
+		{UpstreamID: "gray-a", Weight: -1}}); err != nil {
+		fmt.Printf(">>> invalid plan rejected as expected: %v\n", err)
+	}
+
+	// 按比例投放 20 个不同业务键。
+	hit := map[string]int{}
+	for i := 0; i < 20; i++ {
+		o := gw.Serve(ctx, "gray", fmt.Sprintf("gray-%d", i), "1.2.0", "/pay",
+			fmt.Sprintf("gray-biz-%d", i), "x")
+		hit[o.SelectedUpstream]++
+	}
+	fmt.Printf(">>> weighted split over 20 keys (plan 8:2): %v\n", hit)
+
+	// 比例翻转为 2:8：已固定的业务键不漂移。
+	must(gw.SetSplitPlan("/pay", []graysplit.Entry{
+		{UpstreamID: "gray-a", Weight: 2}, {UpstreamID: "gray-b", Weight: 8}}))
+	o := gw.Serve(ctx, "gray", "gray-sticky", "1.2.0", "/pay", "gray-biz-0", "x")
+	fmt.Printf(">>> sticky after ratio flip: upstream=%s rule=%s (want gray-a/sticky)\n",
+		o.SelectedUpstream, o.SplitRule)
+
+	// 把比例全量压到 gray-a（新键必选 gray-a），随后 gray-a 持续超时：
+	// 首选不可用时回退到健康的 gray-b，不丢请求。
+	must(gw.SetSplitPlan("/pay", []graysplit.Entry{{UpstreamID: "gray-a", Weight: 10}}))
+	grayA.Behavior = &upstream.ScriptedBehavior{FailNextKinds: []upstream.ErrorKind{
+		upstream.KindTimeout, upstream.KindTimeout, upstream.KindTimeout,
+		upstream.KindTimeout, upstream.KindTimeout, upstream.KindTimeout,
+	}}
+	o = gw.Serve(ctx, "gray", "gray-fb", "1.2.0", "/pay", "gray-biz-fb", "x")
+	fmt.Printf(">>> fallback when preferred unhealthy: upstream=%s fallback=%v rule=%s\n",
+		o.SelectedUpstream, o.Fallback, o.SplitRule)
+
+	// 整体回滚到上一份计划（2:8）。
+	must(gw.RollbackSplitPlan("/pay"))
+	fmt.Printf(">>> rolled back to previous plan (revision bump, weights 2:8)\n")
 }
 
 func demoBreaker(ctx context.Context, log logging.Logger) {

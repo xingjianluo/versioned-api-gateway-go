@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -143,7 +144,10 @@ type Decision struct {
 	Allowed  bool
 	Reason   DecisionReason
 	Selected *UpstreamDesc
-	Detail   string
+	// Candidates 是全部兼容上游（同 major 且能力满足），按版本降序；
+	// Selected 恒为 Candidates[0]。供灰度分流在兼容集合内投放。
+	Candidates []UpstreamDesc
+	Detail     string
 }
 
 // Negotiator 根据路由规则在上游集合中做版本协商与能力匹配。
@@ -178,8 +182,9 @@ func (n *Negotiator) Negotiate(ctx context.Context, client Version, rule RouteRu
 		}
 	}
 
-	// 在同 major 候选中找出满足全部能力的集合，取版本最高者。
+	// 在同 major 候选中找出满足全部能力的集合，按版本降序排列，取版本最高者。
 	var best *UpstreamDesc
+	var compatible []UpstreamDesc
 	sawRemoved := false
 	sawCandidate := false
 	for i := range sameMajor {
@@ -203,16 +208,24 @@ func (n *Negotiator) Negotiate(ctx context.Context, client Version, rule RouteRu
 		}
 		if capsOK {
 			sawCandidate = true
+			compatible = append(compatible, *u)
 			if best == nil || Compare(u.Version, best.Version) > 0 {
 				best = u
 			}
 		}
 	}
 	if best != nil {
+		sort.Slice(compatible, func(i, j int) bool {
+			if c := Compare(compatible[i].Version, compatible[j].Version); c != 0 {
+				return c > 0
+			}
+			return compatible[i].ID < compatible[j].ID
+		})
 		return Decision{
-			Allowed:  true,
-			Reason:   ReasonOK,
-			Selected: best,
+			Allowed:    true,
+			Reason:     ReasonOK,
+			Selected:   best,
+			Candidates: compatible,
 			Detail: fmt.Sprintf("client %s -> upstream %s %s (same major, caps %v satisfied)",
 				client, best.ID, best.Version, rule.RequiredCaps),
 		}

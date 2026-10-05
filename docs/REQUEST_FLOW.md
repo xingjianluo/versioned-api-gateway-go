@@ -11,14 +11,21 @@ Serve(caller, requestID, clientVersion, route, idemKey, payload)
   │      （任一不满足 -> version_* 原因，rejected，不触达上游）
   ├─ 4. 分层限流：调用方层 + 路由层原子双扣
   │      （不足 -> caller_quota_exhausted / route_quota_exhausted，rejected）
+  ├─ 4.5 灰度分流：在协商产出的兼容候选集内按路由分流计划选择
+  │      （sticky/weighted/no_plan 等规则可区分；比例原子生效、可整体回滚；
+  │        同一业务幂等键粘性固定，比例调整不漂移）
   ├─ 5. 以业务幂等键去重执行（idempotency.Do）
-  │      └─ invokeWithRetry（固定使用第 3 步选定的同一个上游）：
-  │           a. 熔断器 Allow？ 否 -> degrade_circuit_open（不触达上游）
+  │      └─ invokeWithFallback：按分流给出的确定性偏好顺序尝试候选，
+  │           每个候选内部 invokeWithRetry（固定同一个上游）：
+  │           a. 熔断器 Allow？ 否 -> 记录原因并回退到下一个健康候选
+  │              （split_fallback 日志；全部候选不可用才 degrade_circuit_open）
   │           b. 带超时调用上游
   │           c. 成功 -> 上报熔断成功，缓存成功结果，返回 ok
   │           d. 失败 -> 按错误类别上报熔断；
-  │              semantic 立即失败；其余可重试类别在次数内重试
-  │           e. 次数耗尽 -> degrade_upstream_{timeout|connection|overload}
+  │              semantic 立即失败（绝不回退放大）；
+  │              其余可重试类别先在次数内同上游重试，
+  │              耗尽后回退到下一个健康兼容候选
+  │           e. 全部候选耗尽 -> degrade_upstream_{timeout|connection|overload}
   └─ 6. 每个环节打印结构化日志（见下）
 ```
 
@@ -50,10 +57,14 @@ Serve(caller, requestID, clientVersion, route, idemKey, payload)
 `stage`（version/ratelimit/breaker/invoke/complete）、`decision`、
 `version_basis`/`version_reason`、`quota_layer`/`*_remaining`、
 `breaker_state`、`from`/`to`（熔断迁移）、`attempt`、`retry`/`retry_count`、
-`error_kind`、`retryable`、`business_executions`/`replayed`/`shared`。
+`error_kind`、`retryable`、`business_executions`/`replayed`/`shared`、
+`split_rule`/`split_revision`/`split_weights`/`split_pinned`（灰度分流依据，
+见 [GRAY_SPLIT.md](GRAY_SPLIT.md)）、`split_fallback`（回退标志，
+split_fallback 消息中的 `from`/`to`/`cause` 为回退去向与原因）。
 
 ## 本地验证入口
 
 - 单元/集成测试：`go test ./... -race -count=3`
 - 单进程演示：`go run ./cmd/demo`（覆盖正常调用、版本拒绝、
-  并发限流、抖动重试、幂等重放、回调重放、熔断打开/探测恢复）
+  并发限流、抖动重试、幂等重放、回调重放、熔断打开/探测恢复、
+  灰度分流比例调整/粘性/故障回退/整体回滚）

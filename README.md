@@ -8,6 +8,8 @@
 - 按上游隔离的熔断器（关闭 / 打开 / 半开三态，半开单探测防惊群）；
 - 仅在兼容上游内进行的受限重试，以及与故障类别一一对应的降级路径；
 - 业务幂等键去重（singleflight + 成功结果缓存），重试/重放不重复执行业务；
+- 按路由的灰度分流：兼容候选内按比例投放、原子生效、整体回滚、
+  业务键粘性不漂移、首选故障时确定性回退到健康候选；
 - 回调/通知投递链路：先持久化后投递、确认才算成功、退避有上限、重启可重放。
 
 ## 包结构
@@ -19,6 +21,7 @@
 | `breaker` | 每上游三态熔断器，半开期单探测 |
 | `upstream` | 适配器接口、故障四分类、脚本化故障注入适配器 |
 | `idempotency` | 幂等键去重执行（并发合并、成功缓存、失败不缓存） |
+| `graysplit` | 路由级分流计划（校验/原子发布/回滚）与粘性加权选择 |
 | `callback` | 事件 JSON 文件持久化、退避重放、dead 终态 |
 | `callback/receiver` | 按 EventID 去重的回调接收方参考实现 |
 | `gateway` | 组合以上组件的网关核心 |
@@ -47,11 +50,15 @@ go run ./cmd/demo
 - `quota_layer` / `caller_remaining` / `route_remaining`：配额决策依据；
 - `breaker_state` / `from->to` 状态迁移：熔断决策依据；
 - `attempt` / `retry` / `retry_count`：重试次数；
-- `error_kind`：上游故障类别（timeout / connection / overload / semantic）。
+- `error_kind`：上游故障类别（timeout / connection / overload / semantic）；
+- `split_rule` / `split_revision` / `split_weights` / `split_pinned`：灰度分流
+  命中规则、计划版本、当时生效比例、粘性固定上游；
+- `split_fallback`（`from`/`to`/`cause`）：首选不可用时的回退去向与原因。
 
 ## 文档
 
 - [版本兼容规则](docs/COMPATIBILITY.md)
 - [限流与熔断状态语义](docs/RATELIMIT_BREAKER.md)
 - [回调投递保证](docs/CALLBACK_DELIVERY.md)
+- [灰度分流](docs/GRAY_SPLIT.md)
 - [请求处理链路与决策原因表](docs/REQUEST_FLOW.md)
