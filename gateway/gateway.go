@@ -5,13 +5,18 @@
 //
 //  1. 版本协商：解析客户端版本 -> 路由兼容窗口 -> 同 major 上游能力匹配；
 //  2. 分层限流：调用方层 + 路由层原子双扣；
-//  3. 熔断：该上游断路器是否放行（half-open 只放一个探测）；
-//  4. 幂等去重执行：以业务幂等键去重，内部做受限重试；
-//     - 重试只在“协商选定的同一个上游”内发生，绝不重新协商/跨版本；
+//  3. 灰度分流：在版本协商得到的兼容候选集合内，按路由（可带版本范围）
+//     配置的权重投放；同一业务幂等键被粘性钉住在同一上游（比例调整/回滚/
+//     重试/重放/并发重复都不漂移）；仅当被钉住的上游熔断打开（请求根本不会
+//     发出）时才在健康候选内按同一权重规则回退重选；配置全量校验、原子换入，
+//     非法配置整体拒绝，绝不半更新；
+//  4. 熔断：该上游断路器是否放行（half-open 只放一个探测）；
+//  5. 幂等去重执行：以业务幂等键去重，内部做受限重试；
+//     - 重试只在“分流选定的同一个上游”内发生，绝不重新协商/跨版本；
 //     - 仅 timeout/connection/overload 可重试，semantic 立即失败；
 //     - 失败的调用没有产生业务结果，业务操作只会在首个成功调用执行一次；
 //     成功结果被幂等层缓存，重复请求直接重放，不再触达上游；
-//  5. 全部尝试失败则进入与故障类别一一对应的降级路径。
+//  6. 全部尝试失败则进入与故障类别一一对应的降级路径。
 package gateway
 
 import (
@@ -25,6 +30,7 @@ import (
 	"github.com/xingjianluo/versioned-api-gateway-go/idempotency"
 	"github.com/xingjianluo/versioned-api-gateway-go/internal/logging"
 	"github.com/xingjianluo/versioned-api-gateway-go/ratelimit"
+	"github.com/xingjianluo/versioned-api-gateway-go/split"
 	"github.com/xingjianluo/versioned-api-gateway-go/upstream"
 	"github.com/xingjianluo/versioned-api-gateway-go/versionx"
 )
@@ -57,6 +63,9 @@ type Outcome struct {
 	SelectedUpstream string
 	UpstreamVersion  string
 	VersionNote      string
+	SplitRule        string // 命中的分流配置（"default" 表示无配置走最高版本）
+	SplitReason      split.SelectReason
+	SplitFallback    bool // 是否因健康原因回退到其他候选
 	Retries          int
 	Response         *upstream.Response
 	Detail           string
@@ -76,6 +85,7 @@ type Config struct {
 	RouteLimit  map[string]ratelimit.LayerConfig
 	Breaker     breaker.Config
 	Retry       RetryPolicy
+	Split       []split.RouteConfig // 灰度分流配置（可选；构造期全量校验，非法则拒绝启动）
 }
 
 // Gateway 版本化 API 网关核心。
@@ -85,6 +95,7 @@ type Gateway struct {
 	breakers   *breaker.Registry
 	negotiator *versionx.Negotiator
 	idem       *idempotency.Executor
+	splitter   *split.Router
 	dispatcher *callback.Dispatcher
 	log        logging.Logger
 
@@ -142,10 +153,17 @@ func New(cfg Config, log logging.Logger, opts ...Option) (*Gateway, error) {
 		limiter:    ratelimit.New(cfg.CallerLimit, cfg.RouteLimit),
 		negotiator: versionx.NewNegotiator(),
 		idem:       idempotency.NewExecutor(),
+		splitter:   split.New(),
 		log:        log,
 		adapters:   adapters,
 		upDesc:     descs,
 		now:        time.Now,
+	}
+	if len(cfg.Split) > 0 {
+		// 构造期全量校验分流配置：非法配置直接拒绝启动，绝不静默按默认放行。
+		if err := g.splitter.SetConfigs(cfg.Split, g.knownUpstream); err != nil {
+			return nil, fmt.Errorf("invalid split config: %w", err)
+		}
 	}
 	g.breakers = breaker.NewRegistry(cfg.Breaker, func(id string, from, to breaker.State, reason string) {
 		g.log.Log("WARN", "breaker_transition", map[string]any{
@@ -161,6 +179,31 @@ func New(cfg Config, log logging.Logger, opts ...Option) (*Gateway, error) {
 
 // Dispatcher 返回已挂载的回调调度器（可能为 nil）。
 func (g *Gateway) Dispatcher() *callback.Dispatcher { return g.dispatcher }
+
+// knownUpstream 报告上游 ID 是否存在（供分流配置校验）。
+func (g *Gateway) knownUpstream(id string) bool {
+	_, ok := g.adapters[id]
+	return ok
+}
+
+// UpdateSplitConfigs 运行时调整/整体回滚灰度分流比例。
+// 全量校验通过后原子换入；任一配置非法则整体拒绝，旧配置继续完整生效。
+// 已钉住的业务键不受配置换入换出影响（粘性保证）。
+func (g *Gateway) UpdateSplitConfigs(cfgs []split.RouteConfig) error {
+	if err := g.splitter.SetConfigs(cfgs, g.knownUpstream); err != nil {
+		g.logf("WARN", "split_config_rejected", "error", err.Error(),
+			"generation", g.splitter.Generation())
+		return err
+	}
+	g.logf("INFO", "split_config_applied", "generation", g.splitter.Generation(),
+		"routes", len(cfgs))
+	return nil
+}
+
+// SplitPinOf 返回某业务幂等键当前钉住的上游（可观测/测试用）。
+func (g *Gateway) SplitPinOf(idemKey string) (string, bool) {
+	return g.splitter.PinOf(idemKey)
+}
 
 func (g *Gateway) logf(level, msg string, kv ...any) {
 	fields := map[string]any{}
@@ -230,37 +273,71 @@ func (g *Gateway) Serve(ctx context.Context, caller, requestID, clientVersion,
 		"caller_remaining", fmt.Sprintf("%.2f", ld.CallerRemaining),
 		"route_remaining", fmt.Sprintf("%.2f", ld.RouteRemaining))...)
 
-	adapter := g.adapters[dec.Selected.ID]
+	// 3. 灰度分流：只在版本协商得到的兼容候选集合内投放。
+	candDescs := g.negotiator.Candidates(ctx, clientV, rule, g.upDesc)
+	cands := make([]split.Candidate, 0, len(candDescs))
+	verByID := make(map[string]string, len(candDescs))
+	for _, c := range candDescs {
+		cands = append(cands, split.Candidate{ID: c.ID, Version: c.Version})
+		verByID[c.ID] = c.Version.String()
+	}
+	// 健康 = 熔断器处于 closed；open/half-open 都视为不健康，
+	// 避免恢复瞬间集中冲击（half-open 只放行单探测，由熔断器保证）。
+	healthy := func(id string) bool {
+		return g.breakers.Get(id).CurrentState() == breaker.StateClosed
+	}
+	sel := g.splitter.Select(route, clientV, idemKey, cands, healthy)
+	if sel.UpstreamID == "" {
+		g.logf("WARN", "gateway_reject", append(baseFields,
+			"stage", "split", "decision", "reject", "reason", ReasonNoUpstream)...)
+		return Outcome{RequestID: requestID, Allowed: false, Status: "rejected",
+			Reason: ReasonNoUpstream}
+	}
+	g.logf("INFO", "split_decision", append(baseFields,
+		"stage", "split", "decision", "select",
+		"upstream", sel.UpstreamID, "split_reason", sel.Reason,
+		"split_rule", sel.Rule, "split_weights", sel.Weights,
+		"split_generation", sel.Generation,
+		"fallback", sel.Fallback, "pinned_from", sel.PinnedFrom)...)
+
+	adapter := g.adapters[sel.UpstreamID]
 	if adapter == nil {
 		return Outcome{RequestID: requestID, Allowed: false, Status: "rejected",
 			Reason: ReasonNoUpstream}
 	}
-	br := g.breakers.Get(dec.Selected.ID)
+	br := g.breakers.Get(sel.UpstreamID)
+	selVersion := verByID[sel.UpstreamID]
 
-	// 3+4. 幂等去重执行（内含同上游受限重试）
+	// 4+5. 幂等去重执行（内含同上游受限重试，重试不跨上游/不跨版本）
 	req := upstream.Request{
-		RequestID: requestID, Route: route, Version: dec.Selected.Version.String(),
+		RequestID: requestID, Route: route, Version: selVersion,
 		IdemKey: idemKey, Payload: payload,
 	}
 	res, err := g.idem.Do(ctx, idemKey, func() (any, error) {
-		return g.invokeWithRetry(ctx, br, dec.Selected.ID, adapter, req, baseFields)
+		return g.invokeWithRetry(ctx, br, sel.UpstreamID, adapter, req, baseFields)
 	})
 	if err != nil {
-		o := g.mapUpstreamFailure(requestID, dec.Selected.ID, dec.Selected.Version.String(),
+		o := g.mapUpstreamFailure(requestID, sel.UpstreamID, selVersion,
 			err, baseFields)
 		o.VersionNote = dec.Detail
+		o.SplitRule = sel.Rule
+		o.SplitReason = sel.Reason
+		o.SplitFallback = sel.Fallback
 		return o
 	}
 	ir := res.(invokeResult)
 	stats := g.idem.StatsOf(idemKey)
 	g.logf("INFO", "gateway_ok", append(baseFields,
-		"stage", "complete", "decision", "ok", "upstream", dec.Selected.ID,
+		"stage", "complete", "decision", "ok", "upstream", sel.UpstreamID,
+		"split_reason", sel.Reason, "split_rule", sel.Rule,
+		"split_weights", sel.Weights, "fallback", sel.Fallback,
 		"business_executions", stats.Executed, "replayed", stats.Replayed,
 		"shared", stats.Shared, "retry_count", ir.attempts)...)
 	return Outcome{
 		RequestID: requestID, Allowed: true, Status: "ok", Reason: ReasonOK,
-		SelectedUpstream: dec.Selected.ID, UpstreamVersion: dec.Selected.Version.String(),
-		VersionNote: dec.Detail, Retries: ir.attempts, Response: &ir.resp,
+		SelectedUpstream: sel.UpstreamID, UpstreamVersion: selVersion,
+		VersionNote: dec.Detail, SplitRule: sel.Rule, SplitReason: sel.Reason,
+		SplitFallback: sel.Fallback, Retries: ir.attempts, Response: &ir.resp,
 	}
 }
 

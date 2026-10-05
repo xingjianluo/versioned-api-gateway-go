@@ -19,6 +19,7 @@ import (
 	"github.com/xingjianluo/versioned-api-gateway-go/gateway"
 	"github.com/xingjianluo/versioned-api-gateway-go/internal/logging"
 	"github.com/xingjianluo/versioned-api-gateway-go/ratelimit"
+	"github.com/xingjianluo/versioned-api-gateway-go/split"
 	"github.com/xingjianluo/versioned-api-gateway-go/upstream"
 	"github.com/xingjianluo/versioned-api-gateway-go/versionx"
 )
@@ -148,7 +149,87 @@ func main() {
 	section("7. 熔断：连续过载后打开 -> 快速失败 -> 冷却后单探测恢复")
 	demoBreaker(ctx, log)
 
+	section("8. 灰度分流：按比例投放、粘性不漂移、故障回退、非法配置拒绝")
+	demoSplit(ctx, log)
+
 	fmt.Println("\nDEMO OK")
+}
+
+// demoSplit 演示同 major 双上游的灰度分流能力。
+func demoSplit(ctx context.Context, log logging.Logger) {
+	va := &upstream.ScriptedAdapter{
+		StaticDesc: upstream.StaticDesc{ID: "pay-v14", Version: "1.4.0",
+			Caps: []string{"orders", "refunds"}},
+		Behavior: &upstream.ScriptedBehavior{},
+	}
+	vb := &upstream.ScriptedAdapter{
+		StaticDesc: upstream.StaticDesc{ID: "pay-v13", Version: "1.3.0",
+			Caps: []string{"orders", "refunds"}},
+		Behavior: &upstream.ScriptedBehavior{},
+	}
+	cfg := gateway.Config{
+		RouteRules: map[string]versionx.RouteRule{
+			"/pay": {MinSupported: v("1.0.0"), MaxSupported: v("1.99.0"),
+				RequiredCaps: []string{"orders", "refunds"}},
+		},
+		Upstreams:   []upstream.Adapter{va, vb},
+		CallerLimit: map[string]ratelimit.LayerConfig{"demo-caller": {Rate: 0, Burst: 100000}},
+		RouteLimit:  map[string]ratelimit.LayerConfig{"/pay": {Rate: 0, Burst: 100000}},
+		Breaker:     breaker.Config{FailureThreshold: 3, OpenCoolDown: time.Hour},
+		Retry:       gateway.RetryPolicy{MaxAttempts: 3, AttemptTimeout: 500 * time.Millisecond},
+		Split: []split.RouteConfig{{Route: "/pay", Weights: []split.Weight{
+			{UpstreamID: "pay-v14", Weight: 20}, {UpstreamID: "pay-v13", Weight: 80}}}},
+	}
+	gw, err := gateway.New(cfg, log)
+	must(err)
+
+	// 8.1 按比例投放。
+	count := map[string]int{}
+	for i := 0; i < 500; i++ {
+		key := fmt.Sprintf("gray-%d", i)
+		o := gw.Serve(ctx, "demo-caller", "req-"+key, "1.2.0", "/pay", key, "x")
+		count[o.SelectedUpstream]++
+	}
+	fmt.Printf(">>> gray distribution: %v (want pay-v13 ~80%%)\n", count)
+
+	// 8.2 粘性：比例从 20/80 调到 95/5 再整体回滚，同一业务键不漂移。
+	stickyKey := "gray-sticky-1"
+	first := gw.Serve(ctx, "demo-caller", "req-s1", "1.2.0", "/pay", stickyKey, "x")
+	must(gw.UpdateSplitConfigs([]split.RouteConfig{{Route: "/pay", Weights: []split.Weight{
+		{UpstreamID: "pay-v14", Weight: 95}, {UpstreamID: "pay-v13", Weight: 5}}}}))
+	second := gw.Serve(ctx, "demo-caller", "req-s2", "1.2.0", "/pay", stickyKey, "x")
+	must(gw.UpdateSplitConfigs([]split.RouteConfig{{Route: "/pay", Weights: []split.Weight{
+		{UpstreamID: "pay-v14", Weight: 20}, {UpstreamID: "pay-v13", Weight: 80}}}}))
+	third := gw.Serve(ctx, "demo-caller", "req-s3", "1.2.0", "/pay", stickyKey, "x")
+	fmt.Printf(">>> sticky across flip+rollback: %s -> %s -> %s (must be identical)\n",
+		first.SelectedUpstream, second.SelectedUpstream, third.SelectedUpstream)
+
+	// 8.3 故障回退：pay-v14 熔断打开后，钉在它上面的业务键回退到健康候选。
+	// 注意：脚本索引是适配器累计调用数，这里直接换新 Behavior 让脚本从头生效。
+	va.Behavior = &upstream.ScriptedBehavior{FailNextKinds: []upstream.ErrorKind{
+		upstream.KindConnection, upstream.KindConnection, upstream.KindConnection}}
+	// 找一个被钉到 pay-v14 且调用失败的业务键：它的 3 次连续失败
+	// （重试不跨上游）正好达到熔断阈值；失败不缓存，因此该键有钉住、无成功缓存。
+	pinned := ""
+	for i := 0; ; i++ {
+		k := fmt.Sprintf("on-v14-%d", i)
+		o := gw.Serve(ctx, "demo-caller", "req-"+k, "1.2.0", "/pay", k, "x")
+		if !o.Allowed && o.SelectedUpstream == "pay-v14" {
+			pinned = k
+			break
+		}
+		if i > 1000 {
+			break
+		}
+	}
+	fb := gw.Serve(ctx, "demo-caller", "req-fb", "1.2.0", "/pay", pinned, "x")
+	fmt.Printf(">>> fallback: key=%s landed=%s fallback=%v status=%s\n",
+		pinned, fb.SelectedUpstream, fb.SplitFallback, fb.Status)
+
+	// 8.4 非法配置：整体拒绝，旧配置继续生效。
+	err = gw.UpdateSplitConfigs([]split.RouteConfig{{Route: "/pay", Weights: []split.Weight{
+		{UpstreamID: "pay-v14", Weight: 0}, {UpstreamID: "pay-v13", Weight: 100}}}})
+	fmt.Printf(">>> invalid config rejected: %v\n", err)
 }
 
 func demoBreaker(ctx context.Context, log logging.Logger) {

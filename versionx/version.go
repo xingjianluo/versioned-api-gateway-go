@@ -163,14 +163,8 @@ func (n *Negotiator) Negotiate(ctx context.Context, client Version, rule RouteRu
 		}
 	}
 
-	// 仅同 major 候选可参与匹配。
-	var sameMajor []UpstreamDesc
-	for _, u := range upstreams {
-		if u.Version.Major == client.Major {
-			sameMajor = append(sameMajor, u)
-		}
-	}
-	if len(sameMajor) == 0 {
+	sameMajor, sawSameMajor, sawRemoved := n.compatible(client, rule, upstreams)
+	if !sawSameMajor {
 		return Decision{
 			Allowed: false,
 			Reason:  ReasonNoUpstreamForMajor,
@@ -178,34 +172,12 @@ func (n *Negotiator) Negotiate(ctx context.Context, client Version, rule RouteRu
 		}
 	}
 
-	// 在同 major 候选中找出满足全部能力的集合，取版本最高者。
+	// 在兼容候选中取版本最高者。
 	var best *UpstreamDesc
-	sawRemoved := false
-	sawCandidate := false
 	for i := range sameMajor {
 		u := &sameMajor[i]
-		capsOK := true
-		for _, capName := range rule.RequiredCaps {
-			cap, ok := u.Caps[capName]
-			if !ok {
-				capsOK = false // 从未声明：缺失
-				continue
-			}
-			provided, removed := cap.AvailableAt(u.Version)
-			if removed {
-				sawRemoved = true
-				capsOK = false
-				break
-			}
-			if !provided {
-				capsOK = false
-			}
-		}
-		if capsOK {
-			sawCandidate = true
-			if best == nil || Compare(u.Version, best.Version) > 0 {
-				best = u
-			}
+		if best == nil || Compare(u.Version, best.Version) > 0 {
+			best = u
 		}
 	}
 	if best != nil {
@@ -227,13 +199,61 @@ func (n *Negotiator) Negotiate(ctx context.Context, client Version, rule RouteRu
 				client.Major),
 		}
 	}
-	_ = sawCandidate
 	return Decision{
 		Allowed: false,
 		Reason:  ReasonCapabilityMissing,
 		Detail: fmt.Sprintf("no v%d upstream provides all required caps %v",
 			client.Major, rule.RequiredCaps),
 	}
+}
+
+// Candidates 返回全部兼容候选（同 major 且能力匹配），供灰度分流在
+// 兼容范围内投放；客户端不在路由窗口内时返回空。
+func (n *Negotiator) Candidates(ctx context.Context, client Version, rule RouteRule, upstreams []UpstreamDesc) []UpstreamDesc {
+	if ok, _ := rule.Accepts(client); !ok {
+		return nil
+	}
+	sameMajor, _, _ := n.compatible(client, rule, upstreams)
+	return sameMajor
+}
+
+// compatible 返回同 major 且满足全部所需能力的上游集合，
+// 以及“是否存在同 major 上游”“是否观察到能力被移除的上游”（用于区分拒绝原因）。
+func (n *Negotiator) compatible(client Version, rule RouteRule, upstreams []UpstreamDesc) ([]UpstreamDesc, bool, bool) {
+	var out []UpstreamDesc
+	sawSameMajor := false
+	sawRemoved := false
+	for _, u := range upstreams {
+		if u.Version.Major != client.Major {
+			continue // major 之间存在破坏性变更，绝不跨 major
+		}
+		sawSameMajor = true
+		capsOK := true
+		removed := false
+		for _, capName := range rule.RequiredCaps {
+			cap, ok := u.Caps[capName]
+			if !ok {
+				capsOK = false // 从未声明：缺失
+				continue
+			}
+			provided, rm := cap.AvailableAt(u.Version)
+			if rm {
+				removed = true
+				capsOK = false
+				break
+			}
+			if !provided {
+				capsOK = false
+			}
+		}
+		if removed {
+			sawRemoved = true
+		}
+		if capsOK {
+			out = append(out, u)
+		}
+	}
+	return out, sawSameMajor, sawRemoved
 }
 
 func verOrAny(v Version) string {

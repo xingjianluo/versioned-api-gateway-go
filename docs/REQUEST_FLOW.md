@@ -11,8 +11,11 @@ Serve(caller, requestID, clientVersion, route, idemKey, payload)
   │      （任一不满足 -> version_* 原因，rejected，不触达上游）
   ├─ 4. 分层限流：调用方层 + 路由层原子双扣
   │      （不足 -> caller_quota_exhausted / route_quota_exhausted，rejected）
+  ├─ 4.5 灰度分流：只在第 3 步协商出的兼容候选集合内按权重投放
+  │      （无配置 -> 版本最高候选；业务键粘性钉住；被钉住上游熔断打开
+  │        -> 在健康候选内按权重回退重选并改钉；详见 docs/GRAY_SPLIT.md）
   ├─ 5. 以业务幂等键去重执行（idempotency.Do）
-  │      └─ invokeWithRetry（固定使用第 3 步选定的同一个上游）：
+  │      └─ invokeWithRetry（固定使用第 4.5 步分流选定的同一个上游）：
   │           a. 熔断器 Allow？ 否 -> degrade_circuit_open（不触达上游）
   │           b. 带超时调用上游
   │           c. 成功 -> 上报熔断成功，缓存成功结果，返回 ok
@@ -47,7 +50,9 @@ Serve(caller, requestID, clientVersion, route, idemKey, payload)
 所有日志为单行 `key=value`，常见字段：
 
 `request_id`、`caller`、`route`、`client_version`、`idem_key`、
-`stage`（version/ratelimit/breaker/invoke/complete）、`decision`、
+`stage`（version/ratelimit/split/breaker/invoke/complete）、`decision`、
+`split_rule`/`split_weights`/`split_generation`、`split_reason`、
+`fallback`/`pinned_from`（分流回退）、
 `version_basis`/`version_reason`、`quota_layer`/`*_remaining`、
 `breaker_state`、`from`/`to`（熔断迁移）、`attempt`、`retry`/`retry_count`、
 `error_kind`、`retryable`、`business_executions`/`replayed`/`shared`。
@@ -56,4 +61,5 @@ Serve(caller, requestID, clientVersion, route, idemKey, payload)
 
 - 单元/集成测试：`go test ./... -race -count=3`
 - 单进程演示：`go run ./cmd/demo`（覆盖正常调用、版本拒绝、
-  并发限流、抖动重试、幂等重放、回调重放、熔断打开/探测恢复）
+  并发限流、抖动重试、幂等重放、回调重放、熔断打开/探测恢复、
+  灰度分流投放/粘性/故障回退/非法配置拒绝）
